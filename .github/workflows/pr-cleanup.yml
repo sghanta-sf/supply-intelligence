@@ -1,0 +1,21 @@
+name: Cleanup Lakebase PR Branch
+on:
+  pull_request:
+    types: [closed]
+permissions:
+  contents: read
+jobs:
+  cleanup:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    environment: lakebase-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync
+      - run: uv run python scripts/lakebase_ci.py cleanup --pr "${{ github.event.pull_request.number }}"
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          LAKEBASE_PROJECT: projects/supply-intelligence

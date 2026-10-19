@@ -1,0 +1,51 @@
+bundle:
+  name: supply-intelligence
+
+variables:
+  warehouse_id:
+    description: SQL warehouse ID the app can query
+
+sync:
+  include:
+    - backend/**
+    - frontend/dist/**
+    - migrations/**
+    - scripts/**
+    - app.yaml
+    - requirements.txt
+  exclude:
+    - .git/**
+    - .github/**
+    - .venv/**
+    - frontend/node_modules/**
+    - frontend/src/**
+
+resources:
+  apps:
+    supply_intelligence:
+      name: supply-intelligence
+      description: Apex Healthcare Supply Intelligence Platform
+      source_code_path: .
+      resources:
+        - name: lakebase
+          postgres:
+            branch: projects/supply-intelligence/branches/production
+            database: projects/supply-intelligence/branches/production/databases/databricks-postgres
+            permission: CAN_CONNECT_AND_CREATE
+        - name: model-serving
+          serving_endpoint:
+            name: databricks-claude-sonnet-4-6
+            permission: CAN_QUERY
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+
+targets:
+  dev:
+    default: true
+    mode: development
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

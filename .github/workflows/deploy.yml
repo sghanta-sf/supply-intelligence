@@ -1,0 +1,27 @@
+name: Production Lakebase Migration
+on:
+  push:
+    branches: [main]
+    paths: ["migrations/**", "scripts/lakebase_ci.py"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: lakebase-production
+  cancel-in-progress: false
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: lakebase-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync
+      - run: uv run python scripts/lakebase_ci.py deploy
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          LAKEBASE_PROJECT: projects/supply-intelligence
+          LAKEBASE_SOURCE_BRANCH: projects/supply-intelligence/branches/production
+          LAKEBASE_DATABASE: databricks_postgres

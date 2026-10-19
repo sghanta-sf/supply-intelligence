@@ -1,0 +1,27 @@
+{
+  "name": "supply-intelligence-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "tsc -b"
+  },
+  "dependencies": {
+    "lucide-react": "^1.47.0",
+    "react": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+    "react-dom": "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
+    "react-is": "^19.3.0",
+    "react-markdown": "^10.1.0",
+    "recharts": "^3.10.1",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "https://registry.npmjs.org/@types/react/-/react-18.3.28.tgz",
+    "@types/react-dom": "https://registry.npmjs.org/@types/react-dom/-/react-dom-18.3.7.tgz",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}
