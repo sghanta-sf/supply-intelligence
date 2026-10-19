@@ -100,34 +100,59 @@ supply-intelligence/
 
 ---
 
-## Local Development Quickstart
+## Getting started
 
-### 1. Prerequisites
-- Python 3.11+
-- Node.js 20+ & npm
-- `uv` (Fast Python package installer)
+Prerequisites: Python 3.11+, Node.js 20+, [`uv`](https://docs.astral.sh/uv/), and the [Databricks CLI](https://docs.databricks.com/dev-tools/cli/index.html) authenticated to a workspace that supports Lakebase Autoscaling Postgres.
 
-### 2. Setup & Test Backend
+### 1. Create the Lakebase project
+
+This creates project `supply-intelligence` with a `production` branch and a `databricks_postgres` database. Wait until the command finishes.
+
 ```bash
-# Navigate to project
-cd git_projects/supply-intelligence
+databricks auth login -p <profile>
+databricks postgres create-project supply-intelligence -p <profile>
+databricks postgres list-branches projects/supply-intelligence -p <profile>
+```
 
-# Install Python dependencies and run tests
+Confirm a READY `production` branch before continuing. The app expects endpoint `projects/supply-intelligence/branches/production/endpoints/primary`.
+
+### 2. Configure credentials and apply migrations
+
+```bash
+cp .env.example .env
+# Set DATABRICKS_HOST and either a CLI profile (DATABRICKS_PROFILE)
+# or M2M credentials (DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET).
+# Keep LAKEBASE_PROJECT=supply-intelligence and LAKEBASE_BRANCH=production.
+
 uv sync
 uv run pytest
 
-# Local Lakebase: copy .env.example to .env (gitignored), then set credentials and LAKEBASE_BRANCH
-cp .env.example .env
-# Start FastAPI backend (port 8000) — reads .env for SP + branch
+# Apply SQL in migrations/ to the production branch
+LAKEBASE_PROJECT=projects/supply-intelligence \
+LAKEBASE_SOURCE_BRANCH=projects/supply-intelligence/branches/production \
+LAKEBASE_DATABASE=databricks_postgres \
+uv run python scripts/lakebase_ci.py deploy
+```
+
+`lakebase_ci.py` uses the full resource name (`projects/supply-intelligence`). The app `.env` uses the short project id (`supply-intelligence`); both are required as shown.
+
+Starting the backend also runs any unapplied files in `migrations/` on connect. Use the CLI step above if you want the schema seeded before the first app start.
+
+### 3. Run the app
+
+```bash
 uv run uvicorn backend.main:app --reload --port 8000
 ```
 
-### 3. Setup & Build Frontend
+Without Lakebase, set `USE_MOCK_BACKEND=true` for an in-memory preview (no Postgres, no branching).
+
 ```bash
 cd frontend
 npm ci
 npm run build
 ```
+
+For local UI against the API, `npm run dev` in `frontend/` proxies `/api` to port 8000.
 
 ---
 
