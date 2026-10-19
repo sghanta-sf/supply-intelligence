@@ -8,36 +8,49 @@
 
 ---
 
-## Executive Summary
+## Overview
 
-**Apex Healthcare Systems** operates an 8-facility regional health network (including Apex Memorial Hospital, Apex Children's Medical Center, Apex Valley Health, and the Apex Central Distribution Hub). 
+This repository is a **reference implementation and synthetic demo**, not a production healthcare system. **Apex Healthcare Systems** and all facilities, patients, inventory, orders, and clinical scenarios in the project are fictitious.
 
-Hospital supply chains face catastrophic risk when critical drugs, surgical devices, and consumables experience unpredicted stockouts or sudden FDA recalls. Traditional ERPs report inventory backwards; batch data warehouses refresh too slowly for real-time operating room scheduling.
+The implemented application combines:
 
-The **Apex Supply Intelligence Platform** solves this by unifying:
-1. **Lakehouse Intelligence (Layer 1)**: Ingests ERP + EHR + Pharmacy feeds into Delta Lake Gold tables, runs ML models to score stockout risk and optimize reorders.
-2. **Lakebase Operational Serving (Layer 2)**: Pushes actionable recommendations into Lakebase Autoscaling (PostgreSQL 17) via continuous Synced Tables with &lt; 5ms query response.
-3. **Materials & Pharmacist Workspace**: A React 18 application enabling materials managers and pharmacists to approve orders, evaluate clinical substitutions via Databricks Foundation Model AI, and quarantine recalled lots.
-4. **Platform Admin UI (Layer 3)**: A dedicated devops console within the app allowing developers to create zero-copy database feature branches in &lt; 1 second, mint ephemeral OAuth credentials, and track migration checksums.
+1. **Lakebase operational storage**: PostgreSQL migrations, seeded synthetic data, audited writebacks, and an in-memory fallback for local development.
+2. **Materials and pharmacist workspace**: A React 18 application for reviewing risk records, purchase recommendations, clinical substitutions, recalls, and transfers.
+3. **Clinical substitution agent**: A Databricks Foundation Model endpoint can select investigation steps; deterministic rules are used when model serving is unavailable.
+4. **Platform administration demo**: Databricks Postgres SDK calls for branch lifecycle and short-lived database credentials, plus migration tracking.
+
+### Implementation boundary
+
+The broader LTAP diagram is a **target architecture**. This repository does **not** provision ERP/EHR/pharmacy ingestion, ML training pipelines, continuous Lakehouse-to-Lakebase Synced Tables, or a production SLA.
+
+What the code does provide:
+
+- `migrations/` creates the Lakebase schema and loads synthetic demo records.
+- `scripts/bootstrap_lakehouse.py` performs an explicit, one-time export from Lakebase into Unity Catalog Delta tables. It is not continuous replication.
+- The backend can inspect Lakebase CDF / `wal2delta` and Unity Catalog targets **when they have already been configured in the workspace**. It does not create that reverse-ETL configuration.
+- Latency shown by health endpoints is runtime telemetry or mock/demo data, not a benchmark or guaranteed response time.
 
 ---
 
 ## Business Application Capabilities
 
 ### Supply Operations (Materials Manager & Pharmacist)
-- **Shortage Risk Command**: Real-time visibility into 30 ML-scored shortage items with days-of-supply burn rates, predictive risk factor breakdowns (supplier reliability, lead time variance, port congestion), and 30d/90d demand forecasts.
-- **Recommended Purchase Orders**: 100 AI-optimized proposed purchase orders. Materials managers can **Approve**, **Modify** (quantities/suppliers), or **Reject** with audit logging directly to Lakebase.
+- **Shortage Risk Command**: Interactive views over 30 seeded risk records with days-of-supply, synthetic risk factors, and 30d/90d demand forecasts.
+- **Recommended Purchase Orders**: 100 seeded purchase recommendations. Materials managers can **Approve**, **Modify** (quantities/suppliers), or **Reject** with audit logging directly to Lakebase.
 - **Clinical Substitutions & AI Pharmacist**: Pharmacists view clinical alternatives with bioequivalence ratings (`equivalent`, `similar`, `partial`) and formulary availability. An interactive **Databricks Foundation Model (Claude Sonnet 4.6)** agent evaluates dosing conversion, renal adjustment, and pediatric considerations.
 - **FDA Recall Response**: Multi-facility exposure tracking for Class I, II, and III recalls, with lot mapping, patient exposure counts, and immediate **Quarantine** and **Patient Tracing** actions.
 - **Inter-Facility Transfers**: 20 automated inventory rebalancing recommendations transferring excess stock from the Central Distribution Hub to acute care facilities.
 
-### LTAP Architecture & Telemetry
-- **Synced Tables**: Lakehouse Gold tables continuously replicate to Lakebase operational tables (`supply_intel.risk_scores`, `supply_intel.recommended_orders`, etc.).
-- **Change Data Feed (CDF)**: Operational decisions (approvals, substitution notes, quarantine timestamps) written to Lakebase immediately stream back to Delta Lake for BI executive reporting.
-- **Autoscaling & Scale-to-Zero**: Managed compute automatically scales from 1.0 CU down to zero during inactive periods to eliminate idle infrastructure cost.
+### Optional LTAP integrations
+
+These capabilities require workspace resources configured outside this repository:
+
+- **Lakehouse tables**: The bootstrap script can create snapshot Delta tables from the current Lakebase data.
+- **Lakebase CDF**: The UI reports status for configured CDF / `wal2delta` targets; it does not create them.
+- **Autoscaling and scale-to-zero**: The UI reads endpoint settings from the Databricks API. Actual behavior depends on the deployed Lakebase endpoint configuration.
 
 ### Platform Admin & Branch Lifecycle
-- **Zero-Copy Database Branching**: Dev and ops teams can branch production Lakebase in &lt; 1 second using the Databricks Postgres SDK.
+- **Database Branching**: Dev and ops teams can request Lakebase branches using the Databricks Postgres SDK. Creation time depends on the workspace and service.
 - **Connection Details & Credential Minting**: Generates copyable PostgreSQL connection strings and short-lived (1-hour) OAuth tokens for direct `psql` or local application testing.
 - **Role Management**: Grants branch-level permissions to Service Principals and developer identities using native SQL roles.
 - **SHA-256 Migration Tracking**: Audits applied migrations from `supply_intel.schema_migrations` with drift detection.
