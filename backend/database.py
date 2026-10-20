@@ -928,6 +928,7 @@ def _seed_data() -> dict[str, Any]:
                 "logical_size_bytes": 1048576,
                 "created_at": "2026-09-25T20:59:05Z",
                 "connection": mock_connection(),
+                "roles": [],
             }
         ],
         "migrations": [

@@ -181,6 +181,14 @@ interface TransferItem {
   status: string;
 }
 
+interface BranchRole {
+  id: string;
+  identity: string;
+  identity_type: string;
+  purpose?: string;
+  branch_id?: string;
+}
+
 interface Branch {
   id: string;
   state: string;
@@ -188,6 +196,7 @@ interface Branch {
   parent?: string | null;
   logical_size_bytes?: number;
   ttl_seconds?: number;
+  roles?: BranchRole[];
   connection?: {
     host: string;
     port: number;
@@ -2675,19 +2684,34 @@ export default function App() {
                             </code>
                           </td>
                           <td>
-                            <div style={{ display: "flex", gap: "6px" }}>
-                              <button
-                                className="btn btn-secondary btn-sm"
-                                onClick={() => handleGenerateCred(b.id)}
-                              >
-                                <Key size={12} /> Mint Token
-                              </button>
-                              <button
-                                className="btn btn-secondary btn-sm"
-                                onClick={() => setRoleModal(b.id)}
-                              >
-                                <UserCheck size={12} /> Assign Role
-                              </button>
+                            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                              <div style={{ display: "flex", gap: "6px" }}>
+                                <button
+                                  className="btn btn-secondary btn-sm"
+                                  onClick={() => handleGenerateCred(b.id)}
+                                >
+                                  <Key size={12} /> Mint Token
+                                </button>
+                                <button
+                                  className="btn btn-secondary btn-sm"
+                                  onClick={() => setRoleModal(b.id)}
+                                >
+                                  <UserCheck size={12} /> Assign Role
+                                </button>
+                              </div>
+                              {(b.roles || []).length > 0 ? (
+                                <small style={{ color: "#64748b" }}>
+                                  {(b.roles || []).map((role) => (
+                                    <span key={`${role.id}-${role.purpose}`} style={{ display: "block" }}>
+                                      {role.purpose === "agent" ? "Agent" : role.purpose === "app" ? "App" : "Role"}: {role.identity}
+                                    </span>
+                                  ))}
+                                </small>
+                              ) : (
+                                <small style={{ color: "#94a3b8" }}>
+                                  {b.id === "production" ? "App identity only (not the substitution agent)" : "No agent role"}
+                                </small>
+                              )}
                             </div>
                           </td>
                           <td>

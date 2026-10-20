@@ -27,6 +27,8 @@ resources:
       description: Apex Healthcare Supply Intelligence Platform
       source_code_path: .
       resources:
+        # App identity for dashboard OLTP. The clinical substitution agent is granted
+        # separately, and only on sim-* branches, at simulation time.
         - name: lakebase
           postgres:
             branch: projects/supply-intelligence/branches/production

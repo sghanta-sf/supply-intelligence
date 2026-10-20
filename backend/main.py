@@ -1445,6 +1445,123 @@ async def select_substitution(body: SubstitutionSelectCreate, request: Request) 
     return {"status": "success", "selection_id": row.get("selection_id")}
 
 
+def _agent_identity() -> tuple[str, str]:
+    """Databricks identity the substitution agent authenticates as."""
+    sp_id = (os.environ.get("DATABRICKS_CLIENT_ID") or "").strip()
+    if sp_id:
+        return sp_id, "SERVICE_PRINCIPAL"
+    if store._sdk is not None:
+        try:
+            return store._sdk.current_user.me().user_name, "USER"
+        except Exception:
+            pass
+    return "supply-intel-agent", "SERVICE_PRINCIPAL"
+
+
+def _postgres_role_id(identity: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9-]", "-", identity.lower()).strip("-") or "agent"
+    if not cleaned[0].isalpha():
+        cleaned = f"sp-{cleaned}"
+    return cleaned[:63]
+
+
+def _role_record(identity: str, role_type: str, *, purpose: str, branch_id: str) -> dict[str, Any]:
+    return {
+        "id": _postgres_role_id(identity),
+        "identity": identity,
+        "identity_type": role_type,
+        "purpose": purpose,
+        "branch_id": branch_id,
+    }
+
+
+def _branch_entry(branch_id: str) -> dict[str, Any] | None:
+    for row in store.data.setdefault("branches", []):
+        if row.get("id") == branch_id:
+            row.setdefault("roles", [])
+            return row
+    return None
+
+
+def _mock_grant_role(branch_id: str, identity: str, role_type: str, *, purpose: str) -> dict[str, Any]:
+    record = _role_record(identity, role_type, purpose=purpose, branch_id=branch_id)
+    entry = _branch_entry(branch_id)
+    if entry is not None:
+        roles = entry.setdefault("roles", [])
+        if not any(r.get("id") == record["id"] and r.get("purpose") == purpose for r in roles):
+            roles.append(record)
+    return record
+
+
+async def _list_branch_roles(branch_id: str) -> list[dict[str, Any]]:
+    if store.mock or store._sdk is None:
+        entry = _branch_entry(branch_id)
+        return list((entry or {}).get("roles") or [])
+    parent = f"projects/{PROJECT}/branches/{branch_id}"
+    try:
+        models = await asyncio.to_thread(lambda: list(store._sdk.postgres.list_roles(parent=parent)))
+    except Exception as exc:
+        print(f"Role list warning for {branch_id}: {exc}")
+        return []
+    roles: list[dict[str, Any]] = []
+    agent_id, _ = _agent_identity()
+    for role in models:
+        spec = getattr(role, "spec", None)
+        identity = getattr(spec, "postgres_role", None) or ""
+        identity_type = getattr(getattr(spec, "identity_type", None), "value", None) or "USER"
+        role_id = (getattr(role, "name", "") or "").rsplit("/", 1)[-1]
+        purpose = "app" if branch_id == "production" else (
+            "agent" if branch_id.startswith("sim-") and identity in {agent_id, _postgres_role_id(agent_id), role_id} else "assigned"
+        )
+        roles.append(
+            {
+                "id": role_id,
+                "identity": identity or role_id,
+                "identity_type": identity_type,
+                "purpose": purpose,
+                "branch_id": branch_id,
+            }
+        )
+    return roles
+
+
+async def _create_branch_role(branch_id: str, identity: str, role_type: str, *, purpose: str) -> dict[str, Any]:
+    record = _role_record(identity, role_type, purpose=purpose, branch_id=branch_id)
+    if store.mock or store._sdk is None:
+        return _mock_grant_role(branch_id, identity, role_type, purpose=purpose)
+    parent = f"projects/{PROJECT}/branches/{branch_id}"
+    identity_enum = RoleIdentityType.SERVICE_PRINCIPAL if role_type == "SERVICE_PRINCIPAL" else (
+        RoleIdentityType.GROUP if role_type == "GROUP" else RoleIdentityType.USER
+    )
+    try:
+        operation = await asyncio.to_thread(
+            lambda: store._sdk.postgres.create_role(
+                parent=parent,
+                role_id=record["id"],
+                role=Role(
+                    spec=RoleRoleSpec(
+                        identity_type=identity_enum,
+                        postgres_role=identity,
+                        auth_method=RoleAuthMethod.LAKEBASE_OAUTH_V1,
+                    )
+                ),
+            )
+        )
+        await asyncio.to_thread(operation.wait)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already exists" not in msg and "already_exists" not in msg:
+            raise
+    return record
+
+
+async def _ensure_agent_role_on_sim_branch(branch_id: str) -> dict[str, Any]:
+    if branch_id == "production" or not branch_id.startswith("sim-"):
+        raise RuntimeError("substitution agent role can only be granted on a sim- branch")
+    identity, role_type = _agent_identity()
+    return await _create_branch_role(branch_id, identity, role_type, purpose="agent")
+
+
 async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict[str, Any]:
     live = not (store.mock or store._sdk is None)
     if not live:
@@ -1461,9 +1578,11 @@ async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict
                     "logical_size_bytes": 0,
                     "ttl_seconds": 7200,
                     "connection": mock_branch_connection(branch_id),
+                    "roles": [],
                 }
             )
         create_ms = int((time.perf_counter() - t_create) * 1000) if created else 0
+        agent_role = await _ensure_agent_role_on_sim_branch(branch_id)
         return {
             "id": branch_id,
             "live": False,
@@ -1471,6 +1590,7 @@ async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict
             "create_ms": create_ms,
             "wait_ms": 0,
             "connection": mock_branch_connection(branch_id),
+            "agent_role": agent_role,
         }
 
     name = f"projects/{PROJECT}/branches/{branch_id}"
@@ -1482,6 +1602,7 @@ async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict
             conn_info = branch_connection_details(branch_id, endpoint)
         except Exception:
             conn_info = mock_branch_connection(branch_id)
+        agent_role = await _ensure_agent_role_on_sim_branch(existing.branch_id)
         return {
             "id": existing.branch_id,
             "live": True,
@@ -1489,6 +1610,7 @@ async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict
             "create_ms": 0,
             "wait_ms": 0,
             "connection": conn_info,
+            "agent_role": agent_role,
         }
     except Exception:
         pass
@@ -1517,6 +1639,7 @@ async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict
         conn_info = branch_connection_details(branch_id, endpoint)
     except Exception:
         conn_info = mock_branch_connection(branch_id)
+    agent_role = await _ensure_agent_role_on_sim_branch(branch.branch_id)
     return {
         "id": branch.branch_id,
         "live": True,
@@ -1524,6 +1647,7 @@ async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict
         "create_ms": create_ms,
         "wait_ms": wait_ms,
         "connection": conn_info,
+        "agent_role": agent_role,
     }
 
 
@@ -1544,6 +1668,8 @@ async def _delete_sim_branch(branch_id: str) -> None:
 
 @asynccontextmanager
 async def _branch_pg(branch_id: str):
+    if branch_id == "production":
+        raise RuntimeError("substitution agent writes are not allowed on production")
     if store.mock or store._sdk is None:
         yield None
         return
@@ -1732,11 +1858,16 @@ async def _run_substitution_simulation(
     )
     t1 = time.perf_counter()
     conn_info = branch.get("connection") or mock_branch_connection(branch_id)
+    agent_role = branch.get("agent_role") or {}
+    agent_identity = agent_role.get("identity") or _agent_identity()[0]
     await publish(
         {
             "id": "connect",
             "label": "Connect",
-            "detail": f"Connected to {conn_info.get('host', 'branch')}",
+            "detail": (
+                f"Agent role {agent_identity} granted on {branch_id} only · "
+                f"connected to {conn_info.get('host', 'branch')}"
+            ),
             "duration_ms": int((time.perf_counter() - t1) * 1000),
             "status": "done",
         }
@@ -2503,6 +2634,7 @@ async def platform_overview(request: Request) -> dict[str, Any]:
                     "parent": branch_parent_id(b),
                     "logical_size_bytes": b.status.logical_size_bytes,
                     "connection": mock_branch_connection(b.branch_id),
+                    "roles": await _list_branch_roles(b.branch_id),
                 }
             )
 
@@ -2579,7 +2711,7 @@ async def platform_overview(request: Request) -> dict[str, Any]:
 async def list_branches(request: Request) -> list[dict[str, Any]]:
     require_platform_admin(request)
     if store.mock or store._sdk is None:
-        return store.data.setdefault(
+        branches = store.data.setdefault(
             "branches",
             [
                 {
@@ -2589,9 +2721,13 @@ async def list_branches(request: Request) -> list[dict[str, Any]]:
                     "parent": None,
                     "logical_size_bytes": 1048576,
                     "connection": mock_branch_connection("production"),
+                    "roles": [],
                 }
             ],
         )
+        for row in branches:
+            row["roles"] = await _list_branch_roles(row["id"])
+        return branches
 
     try:
         models = await asyncio.to_thread(
@@ -2607,6 +2743,7 @@ async def list_branches(request: Request) -> list[dict[str, Any]]:
                     "parent": branch_parent_id(b),
                     "logical_size_bytes": b.status.logical_size_bytes,
                     "connection": mock_branch_connection(b.branch_id),
+                    "roles": await _list_branch_roles(b.branch_id),
                 }
             )
         return result
@@ -2632,6 +2769,7 @@ async def create_branch(body: FeatureBranchCreate, request: Request) -> dict[str
             "parent": body.parent,
             "logical_size_bytes": 0,
             "ttl_seconds": body.ttl_seconds,
+            "roles": [],
             "connection": mock_branch_connection(body.branch_id),
         }
         branches.append(new_branch)
@@ -2762,9 +2900,24 @@ async def generate_credential(branch_id: str, request: Request) -> dict[str, Any
         raise HTTPException(502, f"Credential generation failed: {exc}")
 
 
+@app.get("/api/platform/branches/{branch_id}/roles")
+async def list_branch_roles(branch_id: str, request: Request) -> list[dict[str, Any]]:
+    require_platform_admin(request)
+    return await _list_branch_roles(branch_id)
+
+
 @app.post("/api/platform/branches/{branch_id}/roles")
 async def assign_role(branch_id: str, body: BranchRoleAssignment, request: Request) -> dict[str, Any]:
     require_platform_admin(request)
+    target = body.branch_id or branch_id
+    if target != branch_id:
+        raise HTTPException(400, "branch_id in the body must match the path")
+    purpose = "agent" if target.startswith("sim-") else "assigned"
+    try:
+        role = await _create_branch_role(target, body.identity, body.role_type, purpose=purpose)
+    except Exception as exc:
+        raise HTTPException(502, f"Role grant failed on {target}: {exc}") from exc
+
     sql_preview = (
         f"SELECT databricks_create_role('{body.identity}', '{body.role_type}');\n"
         f"GRANT USAGE ON SCHEMA supply_intel TO \"{body.identity}\";\n"
@@ -2776,15 +2929,16 @@ async def assign_role(branch_id: str, body: BranchRoleAssignment, request: Reque
         "grant_role",
         "lakebase_role",
         body.identity,
-        {"branch_id": branch_id, "role_type": body.role_type, "permission": body.permission},
+        {"branch_id": target, "role_type": body.role_type, "permission": body.permission},
     )
 
     return {
         "status": "success",
-        "branch_id": branch_id,
+        "branch_id": target,
         "identity": body.identity,
         "role_type": body.role_type,
         "permission": body.permission,
+        "role": role,
         "executed_sql": sql_preview,
     }
 
