@@ -13,3 +13,7 @@ env:
     value: databricks-claude-sonnet-4-6
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: sql-warehouse
+  - name: LAKEBASE_AGENT_CLIENT_ID
+    valueFrom: agent-client-id
+  - name: LAKEBASE_AGENT_CLIENT_SECRET
+    valueFrom: agent-client-secret

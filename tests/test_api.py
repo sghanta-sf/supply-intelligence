@@ -326,7 +326,9 @@ def test_substitution_branch_simulation_workflow():
     assert discarded.json()["status"] == "discarded"
 
 
-def test_substitution_agent_role_is_only_on_sim_branch():
+def test_substitution_agent_role_is_only_on_sim_branch(monkeypatch):
+    monkeypatch.setenv("LAKEBASE_AGENT_CLIENT_ID", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "11111111-2222-3333-4444-555555555555")
     client = TestClient(app)
     before = {row["id"]: list(row.get("roles") or []) for row in client.get("/api/platform/branches").json()}
     sim = client.post(
@@ -340,13 +342,20 @@ def test_substitution_agent_role_is_only_on_sim_branch():
     assert payload["steps"][1]["id"] == "connect"
     assert "granted on" in payload["steps"][1]["detail"]
     assert "production" not in payload["steps"][1]["detail"].split("granted on", 1)[1].split("only")[0]
+    assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in payload["steps"][1]["detail"]
+    assert "11111111-2222-3333-4444-555555555555" not in payload["steps"][1]["detail"]
 
     branches = {row["id"]: row for row in client.get("/api/platform/branches").json()}
     production_roles = branches["production"].get("roles") or []
     sim_roles = branches[branch_id].get("roles") or []
     assert production_roles == before.get("production", [])
     assert not any(role.get("purpose") == "agent" for role in production_roles)
-    assert any(role.get("purpose") == "agent" and role.get("branch_id") == branch_id for role in sim_roles)
+    assert any(
+        role.get("purpose") == "agent"
+        and role.get("branch_id") == branch_id
+        and role.get("identity") == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        for role in sim_roles
+    )
     assert client.get(f"/api/platform/branches/{branch_id}/roles").json() == sim_roles
     assert client.get("/api/platform/branches/production/roles").json() == production_roles
 

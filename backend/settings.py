@@ -65,6 +65,18 @@ def uses_m2m() -> bool:
     return bool(os.getenv("DATABRICKS_CLIENT_ID") and os.getenv("DATABRICKS_CLIENT_SECRET"))
 
 
+def agent_client_id() -> str:
+    return (os.getenv("LAKEBASE_AGENT_CLIENT_ID") or os.getenv("DATABRICKS_AGENT_CLIENT_ID") or "").strip()
+
+
+def agent_client_secret() -> str:
+    return (os.getenv("LAKEBASE_AGENT_CLIENT_SECRET") or os.getenv("DATABRICKS_AGENT_CLIENT_SECRET") or "").strip()
+
+
+def uses_agent_m2m() -> bool:
+    return bool(agent_client_id() and agent_client_secret())
+
+
 def platform_admin_emails() -> set[str]:
     raw = os.getenv("PLATFORM_ADMIN_EMAILS", DEMO_ADMIN_EMAILS)
     return {item.strip().lower() for item in raw.split(",") if item.strip()}
@@ -95,3 +107,23 @@ def workspace_client():
     if DATABRICKS_PROFILE:
         return WorkspaceClient(profile=DATABRICKS_PROFILE)
     return WorkspaceClient()
+
+
+def agent_workspace_client():
+    """Workspace client for the dedicated agent SP. Never falls back to the app identity."""
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.core import Config
+
+    client_id = agent_client_id()
+    client_secret = agent_client_secret()
+    if not (client_id and client_secret):
+        return None
+    host = os.getenv("DATABRICKS_HOST") or ""
+    return WorkspaceClient(
+        config=Config(
+            host=host or None,
+            client_id=client_id,
+            client_secret=client_secret,
+            auth_type="oauth-m2m",
+        )
+    )

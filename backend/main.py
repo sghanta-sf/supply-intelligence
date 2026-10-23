@@ -39,9 +39,12 @@ from backend.settings import (
     LAKEHOUSE_CDF_SCHEMA,
     PROJECT,
     WAREHOUSE_ID,
+    agent_client_id,
+    agent_workspace_client,
     mock_connection,
     mock_postgres_host,
     platform_admin_emails,
+    uses_agent_m2m,
 )
 from backend.database import current_identity, json_safe, store
 from backend.vectors import similar_items
@@ -1445,17 +1448,22 @@ async def select_substitution(body: SubstitutionSelectCreate, request: Request) 
     return {"status": "success", "selection_id": row.get("selection_id")}
 
 
+def _app_client_id() -> str:
+    return (os.environ.get("DATABRICKS_CLIENT_ID") or os.environ.get("PGUSER") or "").strip()
+
+
 def _agent_identity() -> tuple[str, str]:
-    """Databricks identity the substitution agent authenticates as."""
-    sp_id = (os.environ.get("DATABRICKS_CLIENT_ID") or "").strip()
-    if sp_id:
+    """Dedicated agent SP. Never the Databricks App / dashboard identity."""
+    sp_id = agent_client_id()
+    app_id = _app_client_id()
+    if sp_id and sp_id != app_id:
         return sp_id, "SERVICE_PRINCIPAL"
-    if store._sdk is not None:
-        try:
-            return store._sdk.current_user.me().user_name, "USER"
-        except Exception:
-            pass
-    return "supply-intel-agent", "SERVICE_PRINCIPAL"
+    if store.mock or store._sdk is None:
+        return "supply-intel-agent", "SERVICE_PRINCIPAL"
+    raise RuntimeError(
+        "Set LAKEBASE_AGENT_CLIENT_ID to a service principal distinct from the app SP. "
+        "The agent must not reuse DATABRICKS_CLIENT_ID."
+    )
 
 
 def _postgres_role_id(identity: str) -> str:
@@ -1555,11 +1563,38 @@ async def _create_branch_role(branch_id: str, identity: str, role_type: str, *, 
     return record
 
 
+async def _grant_agent_sql_on_sim_branch(branch_id: str, role_id: str, identity: str) -> None:
+    """App SP grants table privileges to the agent role; it does not run simulation SQL."""
+    names = {role_id.replace('"', ""), identity.replace('"', "")}
+    statements: list[str] = []
+    for quoted in names:
+        if not quoted:
+            continue
+        statements.extend(
+            (
+                f'GRANT USAGE ON SCHEMA supply_intel TO "{quoted}"',
+                f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA supply_intel TO "{quoted}"',
+                f'ALTER DEFAULT PRIVILEGES IN SCHEMA supply_intel GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{quoted}"',
+            )
+        )
+    async with _branch_pg(branch_id, identity="app") as conn:
+        if conn is None:
+            return
+        async with conn.cursor() as cur:
+            for statement in statements:
+                await cur.execute(statement)
+
+
 async def _ensure_agent_role_on_sim_branch(branch_id: str) -> dict[str, Any]:
     if branch_id == "production" or not branch_id.startswith("sim-"):
         raise RuntimeError("substitution agent role can only be granted on a sim- branch")
     identity, role_type = _agent_identity()
-    return await _create_branch_role(branch_id, identity, role_type, purpose="agent")
+    record = await _create_branch_role(branch_id, identity, role_type, purpose="agent")
+    try:
+        await _grant_agent_sql_on_sim_branch(branch_id, record["id"], identity)
+    except Exception as exc:
+        print(f"Agent SQL grant warning on {branch_id}: {exc}")
+    return record
 
 
 async def _ensure_sim_branch(branch_id: str, parent: str = "production") -> dict[str, Any]:
@@ -1667,23 +1702,33 @@ async def _delete_sim_branch(branch_id: str) -> None:
 
 
 @asynccontextmanager
-async def _branch_pg(branch_id: str):
+async def _branch_pg(branch_id: str, *, identity: str = "agent"):
     if branch_id == "production":
         raise RuntimeError("substitution agent writes are not allowed on production")
     if store.mock or store._sdk is None:
         yield None
         return
+    if identity == "agent":
+        if not uses_agent_m2m() or agent_client_id() == _app_client_id():
+            raise RuntimeError(
+                "Agent branch SQL requires LAKEBASE_AGENT_CLIENT_ID and LAKEBASE_AGENT_CLIENT_SECRET "
+                "for a service principal distinct from the app SP"
+            )
+        sdk = agent_workspace_client()
+        username = agent_client_id()
+    else:
+        sdk = store._sdk
+        username = _app_client_id() or sdk.current_user.me().user_name
     endpoint_name = f"projects/{PROJECT}/branches/{branch_id}/endpoints/primary"
     last_exc: Exception | None = None
     for _ in range(4):
         try:
-            endpoint = await asyncio.to_thread(store._sdk.postgres.get_endpoint, name=endpoint_name)
+            endpoint = await asyncio.to_thread(sdk.postgres.get_endpoint, name=endpoint_name)
             host = endpoint.status.hosts.host if endpoint.status and endpoint.status.hosts else None
             if not host:
                 raise RuntimeError("branch endpoint has no host")
-            username = os.environ.get("DATABRICKS_CLIENT_ID") or store._sdk.current_user.me().user_name
             credential = await asyncio.to_thread(
-                store._sdk.postgres.generate_database_credential, endpoint=endpoint_name
+                sdk.postgres.generate_database_credential, endpoint=endpoint_name
             )
             conn = await psycopg.AsyncConnection.connect(
                 host=host,
@@ -1865,7 +1910,7 @@ async def _run_substitution_simulation(
             "id": "connect",
             "label": "Connect",
             "detail": (
-                f"Agent role {agent_identity} granted on {branch_id} only · "
+                f"Dedicated agent SP {agent_identity} granted on {branch_id} only · "
                 f"connected to {conn_info.get('host', 'branch')}"
             ),
             "duration_ms": int((time.perf_counter() - t1) * 1000),

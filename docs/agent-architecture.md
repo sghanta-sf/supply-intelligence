@@ -187,7 +187,7 @@ Unexpected findings typically include: P&T class-switch flag, pediatric patients
 ## Guardrails
 
 - Simulation is isolated on a `sim-` branch until apply.
-- The substitution agent’s Lakebase role is created only on that `sim-` branch. Production keeps the Databricks App identity for the dashboard; the simulation path never grants the agent role there.
+- The Databricks App SP creates the `sim-` branch. A **separate agent service principal** (`LAKEBASE_AGENT_CLIENT_ID`) is granted a Postgres role on that branch only and is the identity that reads/writes simulation SQL. Production OLTP stays on the app SP; the agent SP is never granted on production.
 - Approve ≠ apply. Production changes only on **Apply to live formulary**.
 - Stop-severity cohorts (angioedema, age exclusion) must not be treated as auto-swap.
 - Foundation Model output is constrained to known investigation IDs; unknown IDs are dropped.

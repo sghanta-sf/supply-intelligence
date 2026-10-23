@@ -27,8 +27,8 @@ resources:
       description: Apex Healthcare Supply Intelligence Platform
       source_code_path: .
       resources:
-        # App identity for dashboard OLTP. The clinical substitution agent is granted
-        # separately, and only on sim-* branches, at simulation time.
+        # App identity for dashboard OLTP and branch create. Agent SP credentials
+        # (scope supply-intelligence) are used only for simulation SQL on sim-* branches.
         - name: lakebase
           postgres:
             branch: projects/supply-intelligence/branches/production
@@ -42,6 +42,16 @@ resources:
           sql_warehouse:
             id: ${var.warehouse_id}
             permission: CAN_USE
+        - name: agent-client-id
+          secret:
+            scope: supply-intelligence
+            key: agent-client-id
+            permission: READ
+        - name: agent-client-secret
+          secret:
+            scope: supply-intelligence
+            key: agent-client-secret
+            permission: READ
 
 targets:
   dev:
