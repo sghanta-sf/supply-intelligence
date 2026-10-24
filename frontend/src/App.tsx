@@ -124,7 +124,8 @@ interface SubstitutionSimulation {
   branch_id: string;
   live_branch?: boolean;
   status: string;
-  steps: { id: string; label: string; detail: string; duration_ms: number; status: string }[];
+  steps: { id: string; label: string; detail: string; duration_ms: number; status: string; transcript?: SimAgentTurn[] }[];
+  live_transcript?: SimAgentTurn[];
   impact?: {
     shortage_item_id: string;
     shortage_item_description: string;
@@ -450,8 +451,21 @@ function BranchTree({ branches, highlightId }: { branches: Branch[]; highlightId
   );
 }
 
+type WorkspacePersona = "materials" | "pharmacist";
+
+const PERSONA_HOME: Record<WorkspacePersona, string> = {
+  materials: "risk-command",
+  pharmacist: "substitutions",
+};
+
+const PERSONA_TABS: Record<WorkspacePersona, string[]> = {
+  materials: ["risk-command", "orders", "transfers"],
+  pharmacist: ["substitutions", "recalls"],
+};
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>("risk-command");
+  const [persona, setPersona] = useState<WorkspacePersona>("materials");
   const [kpis, setKpis] = useState<KPI[]>([]);
   const [riskItems, setRiskItems] = useState<RiskItem[]>([]);
   const [orders, setOrders] = useState<RecommendedOrder[]>([]);
@@ -613,7 +627,11 @@ export default function App() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.detail || `Could not save comment (${res.status})`);
+        const detail = data.detail;
+        const message = Array.isArray(detail)
+          ? detail.map((item: { msg?: string }) => item.msg).filter(Boolean).join("; ")
+          : detail;
+        throw new Error(message || `Could not save comment (${res.status})`);
       }
       setOrders((prev) =>
         prev.map((order) => (order.recommendation_id === orderId ? { ...order, comments } : order))
@@ -763,11 +781,14 @@ export default function App() {
           if (!line.trim()) continue;
           const event = JSON.parse(line);
           if (event.event === "step") {
+            const running = (event.steps || []).find((step: { status?: string; transcript?: SimAgentTurn[] }) => step.status === "running")
+              || (event.steps || []).find((step: { transcript?: SimAgentTurn[] }) => step.transcript);
             setSimulation((prev) => ({
               simulation_id: prev?.simulation_id || "",
               branch_id: event.branch_id || prev?.branch_id || "",
               status: "running",
               steps: event.steps || prev?.steps || [],
+              live_transcript: running?.transcript || prev?.live_transcript,
               impact: prev?.impact,
             }));
           } else if (event.event === "complete") {
@@ -862,10 +883,16 @@ export default function App() {
     }
   };
 
+  const focusPharmacistAdvisor = () => {
+    document.getElementById("pharmacist-advisor")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
   // AI Agent Query
   const handleAgentQuery = async (customPrompt?: string) => {
-    const q = customPrompt || agentPrompt;
+    const q = (customPrompt || agentPrompt).trim();
     if (!q) return;
+    if (customPrompt) setAgentPrompt(q);
+    focusPharmacistAdvisor();
     const wantsSimulation = /simulate\s+(switching|impact|substitution)/i.test(q) || (/simulate/i.test(q) && /switch/i.test(q));
     if (wantsSimulation) {
       const fromLisinopril = /lisinopril/i.test(q);
@@ -1120,6 +1147,15 @@ export default function App() {
     "decision-insights",
   ].includes(activeTab);
 
+  const switchPersona = (next: WorkspacePersona) => {
+    setPersona(next);
+    const home = PERSONA_HOME[next];
+    const primary = PERSONA_TABS[next];
+    if (!primary.includes(activeTab) && activeTab !== "decision-insights" && activeTab !== "platform-admin") {
+      setActiveTab(home);
+    }
+  };
+
   return (
     <div className="app-container">
       {/* Toast Notification */}
@@ -1159,52 +1195,70 @@ export default function App() {
         </div>
 
         <nav className="sidebar-nav">
-          <div className="nav-section-title">Supply Operations</div>
-          <button
-            className={`nav-button ${activeTab === "risk-command" ? "active" : ""}`}
-            onClick={() => setActiveTab("risk-command")}
-          >
-            <AlertTriangle size={17} />
-            <span>Risk Command Center</span>
-            <span className="nav-badge alert">30</span>
-          </button>
+          <div className={`nav-group ${persona === "materials" ? "nav-group-active" : ""}`}>
+            <div className="nav-section-title">Supply operations</div>
+            <button
+              className={`nav-button ${activeTab === "risk-command" ? "active" : ""}`}
+              onClick={() => {
+                setPersona("materials");
+                setActiveTab("risk-command");
+              }}
+            >
+              <AlertTriangle size={17} />
+              <span>Risk Command Center</span>
+              <span className="nav-badge alert">30</span>
+            </button>
+            <button
+              className={`nav-button ${activeTab === "orders" ? "active" : ""}`}
+              onClick={() => {
+                setPersona("materials");
+                setActiveTab("orders");
+              }}
+            >
+              <FileText size={17} />
+              <span>Recommended Orders</span>
+              <span className="nav-badge">100</span>
+            </button>
+            <button
+              className={`nav-button ${activeTab === "transfers" ? "active" : ""}`}
+              onClick={() => {
+                setPersona("materials");
+                setActiveTab("transfers");
+              }}
+            >
+              <ArrowRightLeft size={17} />
+              <span>Inter-Facility Transfers</span>
+              <span className="nav-badge">20</span>
+            </button>
+          </div>
 
-          <button
-            className={`nav-button ${activeTab === "orders" ? "active" : ""}`}
-            onClick={() => setActiveTab("orders")}
-          >
-            <FileText size={17} />
-            <span>Recommended Orders</span>
-            <span className="nav-badge">100</span>
-          </button>
+          <div className={`nav-group ${persona === "pharmacist" ? "nav-group-active" : ""}`}>
+            <div className="nav-section-title">Pharmacy operations</div>
+            <button
+              className={`nav-button ${activeTab === "substitutions" ? "active" : ""}`}
+              onClick={() => {
+                setPersona("pharmacist");
+                setActiveTab("substitutions");
+              }}
+            >
+              <BrainCircuit size={17} />
+              <span>Clinical Substitutions</span>
+              <span className="nav-badge">15</span>
+            </button>
+            <button
+              className={`nav-button ${activeTab === "recalls" ? "active" : ""}`}
+              onClick={() => {
+                setPersona("pharmacist");
+                setActiveTab("recalls");
+              }}
+            >
+              <ShieldAlert size={17} />
+              <span>FDA Recall Response</span>
+              <span className="nav-badge alert">3</span>
+            </button>
+          </div>
 
-          <button
-            className={`nav-button ${activeTab === "substitutions" ? "active" : ""}`}
-            onClick={() => setActiveTab("substitutions")}
-          >
-            <BrainCircuit size={17} />
-            <span>Clinical Substitutions</span>
-            <span className="nav-badge">15</span>
-          </button>
-
-          <button
-            className={`nav-button ${activeTab === "recalls" ? "active" : ""}`}
-            onClick={() => setActiveTab("recalls")}
-          >
-            <ShieldAlert size={17} />
-            <span>FDA Recall Response</span>
-            <span className="nav-badge alert">3</span>
-          </button>
-
-          <button
-            className={`nav-button ${activeTab === "transfers" ? "active" : ""}`}
-            onClick={() => setActiveTab("transfers")}
-          >
-            <ArrowRightLeft size={17} />
-            <span>Inter-Facility Transfers</span>
-            <span className="nav-badge">20</span>
-          </button>
-
+          <div className="nav-section-title">Shared</div>
           <button
             className={`nav-button ${activeTab === "decision-insights" ? "active" : ""}`}
             onClick={() => setActiveTab("decision-insights")}
@@ -1238,6 +1292,22 @@ export default function App() {
           </div>
 
           <div className="header-right">
+            <div className="persona-switch" role="group" aria-label="Workspace persona">
+              <button
+                type="button"
+                className={`persona-chip ${persona === "materials" ? "active" : ""}`}
+                onClick={() => switchPersona("materials")}
+              >
+                Materials manager
+              </button>
+              <button
+                type="button"
+                className={`persona-chip ${persona === "pharmacist" ? "active" : ""}`}
+                onClick={() => switchPersona("pharmacist")}
+              >
+                Pharmacist
+              </button>
+            </div>
             <div className="live-metrics-chip">
               <Zap size={14} />
               <span>Live Supply Network</span>
@@ -1246,7 +1316,7 @@ export default function App() {
               <div className="avatar-circle">SG</div>
               <div className="user-profile-text">
                 <strong>Sumanth Ghanta</strong>
-                <small>Materials & Platform Admin</small>
+                <small>{persona === "pharmacist" ? "Clinical pharmacist" : "Materials manager"}</small>
               </div>
             </div>
           </div>
@@ -1277,7 +1347,7 @@ export default function App() {
                         : "Waiting for first update"}
                     </small>
                   </div>
-                  <button className="btn btn-primary" onClick={() => setActiveTab("orders")}>
+                  <button className="btn btn-primary" onClick={() => { setPersona("materials"); setActiveTab("orders"); }}>
                     Review Recommended Orders <ChevronRight size={14} />
                   </button>
                 </div>
@@ -1563,12 +1633,12 @@ export default function App() {
               <div className="page-header">
                 <div className="page-title-group">
                   <h1>Clinical Substitution Manager &amp; Pharmacist Advisor</h1>
-                  <p>Help Apex pharmacists evaluate safe, formulary-aligned alternatives for backordered medications and clinical supplies.</p>
+                  <p>Pharmacy decides the interchange on an isolated working copy. Purchasing still lives under Recommended Orders.</p>
                 </div>
               </div>
 
               {/* Pharmacist Guidance Banner */}
-              <div className="ai-agent-banner">
+              <div className="ai-agent-banner" id="pharmacist-advisor">
                 <div className="ai-agent-header">
                   <div className="ai-agent-badge">
                     <Sparkles size={14} />
@@ -1646,18 +1716,24 @@ export default function App() {
                   </button>
                 </div>
 
-                {agentResponse && (
+                {(agentLoading || agentResponse) && (
                   <div className="ai-response-box">
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
                       <strong style={{ color: "#38bdf8", display: "flex", alignItems: "center", gap: "6px" }}>
                         <BrainCircuit size={16} /> Clinical Pharmacy Guidance
                       </strong>
-                      <small style={{ color: "#94a3b8" }}>Decision support · Pharmacist review required</small>
+                      <small style={{ color: "#94a3b8" }}>
+                        {agentLoading ? "Reviewing the catalog match…" : "Decision support · Pharmacist review required"}
+                      </small>
                     </div>
                     <div className="ai-response-content">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {agentResponse}
-                      </ReactMarkdown>
+                      {agentLoading ? (
+                        <p>The advisor is reviewing this substitution in the chat above.</p>
+                      ) : (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {agentResponse}
+                        </ReactMarkdown>
+                      )}
                     </div>
                   </div>
                 )}
@@ -1750,6 +1826,24 @@ export default function App() {
                       ))}
                     </ul>
                   )}
+                  {simulating && simulation?.live_transcript && simulation.live_transcript.length > 0 && !simulation.impact && (
+                    <details className="sim-transcript" open>
+                      <summary>Agent investigation · live on {simulation.branch_id || "working copy"}</summary>
+                      <ol>
+                        {simulation.live_transcript.map((turn, idx) => (
+                          <li key={`${turn.phase}-${idx}`}>
+                            <span className="sim-phase">{turn.phase}</span>
+                            <p>{turn.thought}</p>
+                            <small>
+                              <span className="sim-tool">{turn.tool}</span>
+                              {" → "}
+                              {turn.result}
+                            </small>
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
+                  )}
                   {simError && <p className="sim-error">{simError}</p>}
                   {simulation?.impact && (
                     <>
@@ -1805,11 +1899,15 @@ export default function App() {
                           </ul>
                         </div>
                       )}
-                      {simulation.impact.agent?.transcript && simulation.impact.agent.transcript.length > 0 && (
+                      {((simulation.impact.agent?.transcript && simulation.impact.agent.transcript.length > 0)
+                        || (simulation.live_transcript && simulation.live_transcript.length > 0)) && (
                         <details className="sim-transcript" open>
-                          <summary>Agent investigation ({simulation.impact.agent.planner || "rules"})</summary>
+                          <summary>
+                            Agent investigation ({simulation.impact.agent?.planner || "branch SQL"})
+                            {simulating ? " · live" : ""}
+                          </summary>
                           <ol>
-                            {simulation.impact.agent.transcript.map((turn, idx) => (
+                            {(simulation.impact.agent?.transcript || simulation.live_transcript || []).map((turn, idx) => (
                               <li key={`${turn.phase}-${idx}`}>
                                 <span className="sim-phase">{turn.phase}</span>
                                 <p>{turn.thought}</p>
@@ -2847,6 +2945,7 @@ export default function App() {
                 className="btn btn-primary"
                 onClick={() => {
                   setSelectedRiskItem(null);
+                  setPersona("pharmacist");
                   setActiveTab("substitutions");
                   openShortageAlternatives(selectedRiskItem.item_id, selectedRiskItem.item_description);
                   handleAgentQuery(`Evaluate clinical alternatives for shortage item ${selectedRiskItem.item_description}`);

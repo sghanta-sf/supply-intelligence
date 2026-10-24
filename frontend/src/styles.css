@@ -135,6 +135,18 @@ button {
   overflow-y: auto;
 }
 
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  opacity: 0.72;
+  transition: opacity 0.15s ease;
+}
+
+.nav-group-active {
+  opacity: 1;
+}
+
 .nav-section-title {
   font-size: 10px;
   font-weight: 700;
@@ -142,6 +154,32 @@ button {
   text-transform: uppercase;
   letter-spacing: 1px;
   padding: 12px 10px 4px;
+}
+
+.persona-switch {
+  display: flex;
+  background: #eef2f6;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  padding: 3px;
+  gap: 2px;
+}
+
+.persona-chip {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.persona-chip.active {
+  background: #ffffff;
+  color: var(--brand-teal);
+  box-shadow: var(--shadow-sm);
 }
 
 .nav-button {

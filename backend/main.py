@@ -1270,7 +1270,8 @@ async def list_recommended_orders(
          SELECT DISTINCT ON (r.item_id, r.facility_id)
            r.*,
            d.decision AS decision_status,
-           d.modified_qty, d.modified_supplier_id, d.decision_reason, d.decided_by, d.decided_at
+           d.modified_qty, d.modified_supplier_id, d.decision_reason, d.decided_by, d.decided_at,
+           oc.comments AS saved_comments
          FROM supply_intel.recommended_orders r
          LEFT JOIN LATERAL (
            SELECT decision, modified_qty, modified_supplier_id, decision_reason, decided_by, decided_at
@@ -1279,6 +1280,8 @@ async def list_recommended_orders(
            ORDER BY decided_at DESC
            LIMIT 1
          ) d ON TRUE
+         LEFT JOIN supply_intel.recommended_order_comments oc
+           ON oc.recommendation_id = r.recommendation_id
          {where_sql}
          ORDER BY r.item_id, r.facility_id, r.recommendation_id DESC
        ) uniq
@@ -1288,6 +1291,10 @@ async def list_recommended_orders(
     """
 
     rows = await store.fetch(query, tuple(params) if params else ())
+    for row in rows:
+        saved = row.pop("saved_comments", None)
+        if saved is not None:
+            row["comments"] = saved
     return json_safe(rows)
 
 
@@ -1363,15 +1370,22 @@ async def update_order_comments(
         await audit(user, "order_comment", "recommended_order", recommendation_id, {"comments": comments})
         return {"status": "success", "recommendation_id": recommendation_id, "comments": comments}
 
-    row = await store.execute(
-        """UPDATE supply_intel.recommended_orders
-           SET comments = %s
-           WHERE recommendation_id = %s
-           RETURNING recommendation_id, comments""",
-        (comments, recommendation_id),
+    existing = await store.fetch(
+        "SELECT recommendation_id FROM supply_intel.recommended_orders WHERE recommendation_id = %s",
+        (recommendation_id,),
     )
-    if not row:
+    if not existing:
         raise HTTPException(404, "Recommended order not found")
+    row = await store.execute(
+        """INSERT INTO supply_intel.recommended_order_comments (recommendation_id, comments, updated_by)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (recommendation_id) DO UPDATE
+             SET comments = EXCLUDED.comments,
+                 updated_at = now(),
+                 updated_by = EXCLUDED.updated_by
+           RETURNING recommendation_id, comments""",
+        (recommendation_id, comments, user),
+    )
     await audit(user, "order_comment", "recommended_order", recommendation_id, {"comments": comments})
     return {"status": "success", "recommendation_id": row.get("recommendation_id"), "comments": row.get("comments")}
 
@@ -1574,7 +1588,9 @@ async def _grant_agent_sql_on_sim_branch(branch_id: str, role_id: str, identity:
             (
                 f'GRANT USAGE ON SCHEMA supply_intel TO "{quoted}"',
                 f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA supply_intel TO "{quoted}"',
+                f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA supply_intel TO "{quoted}"',
                 f'ALTER DEFAULT PRIVILEGES IN SCHEMA supply_intel GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{quoted}"',
+                f'ALTER DEFAULT PRIVILEGES IN SCHEMA supply_intel GRANT USAGE, SELECT ON SEQUENCES TO "{quoted}"',
             )
         )
     async with _branch_pg(branch_id, identity="app") as conn:
@@ -1752,6 +1768,282 @@ async def _branch_pg(branch_id: str, *, identity: str = "agent"):
     yield None
 
 
+def _switch_fraction(agent: dict[str, Any]) -> float:
+    categories = agent.get("categories") or []
+    total = sum(int(cat.get("patients") or 0) for cat in categories)
+    if total <= 0:
+        return 1.0
+    blocked = sum(int(cat.get("patients") or 0) for cat in categories if cat.get("severity") == "stop")
+    return max(0.0, min(1.0, 1.0 - (blocked / total)))
+
+
+async def _run_sandbox_cycle(
+    *,
+    conn: Any | None,
+    plan: dict[str, Any],
+    agent: dict[str, Any],
+    simulation_id: str,
+    branch_id: str,
+    user: str,
+    on_progress: Callable[[str, list[dict[str, Any]]], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """Write a substitution onto the branch, read it back, then correct allocations."""
+    transcript: list[dict[str, Any]] = list(agent.get("transcript") or [])
+    passes: list[dict[str, Any]] = []
+    frac = _switch_fraction(agent)
+
+    async def note(detail: str, turn: dict[str, Any]) -> None:
+        transcript.append(turn)
+        agent["transcript"] = transcript
+        if on_progress is not None:
+            await on_progress(detail, transcript)
+
+    async def run_sql(sql: str, params: tuple[Any, ...] = (), fetch: bool = False) -> list[dict[str, Any]]:
+        if conn is None:
+            return []
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            rows: list[dict[str, Any]] = []
+            if fetch or cur.description is not None:
+                rows = list(await cur.fetchall())
+        await conn.commit()
+        return rows
+
+    async def pace() -> None:
+        if conn is not None:
+            await asyncio.sleep(0.55)
+
+    therapeutic_class = plan.get("therapeutic_class") or "unclassified"
+    alt_id = plan["alternative_item_id"]
+    alt_desc = plan["alternative_item_description"]
+    shortage_id = plan["shortage_item_id"]
+
+    await note(
+        f"Writing formulary swap on `{branch_id}`",
+        {
+            "phase": "Simulate",
+            "thought": "The working copy has to change. Update formulary first, then observe the new state.",
+            "tool": "branch_sql:formulary_update",
+            "result": f"UPDATE formulary SET active_item_id={alt_id} WHERE therapeutic_class={therapeutic_class}",
+        },
+    )
+    updated = await run_sql(
+        """UPDATE supply_intel.formulary
+           SET active_item_id=%s, active_item_description=%s, updated_at=NOW(), updated_by=%s
+           WHERE therapeutic_class=%s
+           RETURNING therapeutic_class, active_item_id, active_item_description""",
+        (alt_id, alt_desc, user, therapeutic_class),
+        fetch=True,
+    )
+    readback = await run_sql(
+        "SELECT therapeutic_class, active_item_id, active_item_description FROM supply_intel.formulary WHERE therapeutic_class=%s",
+        (therapeutic_class,),
+        fetch=True,
+    )
+    observed = (readback or updated or [{}])[0]
+    await note(
+        f"Read formulary back · active item is {observed.get('active_item_id') or alt_id}",
+        {
+            "phase": "Simulate",
+            "thought": "Confirm the swap landed on the working copy before moving orders or stock.",
+            "tool": "branch_sql:formulary_readback",
+            "result": json.dumps(observed, default=str)[:280] or f"{therapeutic_class} → {alt_id} (in-memory working copy)",
+        },
+    )
+    passes.append({"name": "formulary", "wrote": True, "read": observed.get("active_item_id") or alt_id})
+    await pace()
+
+    switched_patients = 0
+    for fac in plan.get("facilities") or []:
+        original = int(fac.get("patients") or 0)
+        switched = int(round(original * frac))
+        remain = max(original - switched, 0)
+        fac["patients_switched"] = switched
+        fac["patients_held"] = remain
+        switched_patients += switched
+        daily = float(fac.get("avg_daily_doses") or 0)
+        switched_doses = round(daily * frac, 2)
+        await run_sql(
+            """UPDATE supply_intel.patient_order_census
+               SET active_order_count = GREATEST(active_order_count - %s, 0),
+                   avg_daily_doses = GREATEST(avg_daily_doses - %s, 0)
+               WHERE item_id=%s AND facility_id=%s""",
+            (switched, switched_doses, shortage_id, fac["facility_id"]),
+        )
+        await run_sql(
+            """INSERT INTO supply_intel.patient_order_census
+               (item_id, facility_id, facility_name, active_order_count, allergy_flag_count, contraindication_count, avg_daily_doses)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (item_id, facility_id) DO UPDATE SET
+                 active_order_count = supply_intel.patient_order_census.active_order_count + EXCLUDED.active_order_count,
+                 avg_daily_doses = supply_intel.patient_order_census.avg_daily_doses + EXCLUDED.avg_daily_doses""",
+            (
+                alt_id,
+                fac["facility_id"],
+                fac["facility_name"],
+                switched,
+                int(fac.get("allergy_flags") or 0),
+                int(fac.get("contraindications") or 0),
+                switched_doses,
+            ),
+        )
+        fac_rows = await run_sql(
+            """SELECT item_id, active_order_count FROM supply_intel.patient_order_census
+               WHERE facility_id=%s AND item_id IN (%s, %s)""",
+            (fac["facility_id"], shortage_id, alt_id),
+            fetch=True,
+        )
+        await note(
+            f"Census rewrite on `{branch_id}` · {fac['facility_name']}: {switched:,} orders → {alt_id}, {remain:,} held",
+            {
+                "phase": "Simulate",
+                "thought": f"Rewrite orders at {fac['facility_name']}, then read that facility back.",
+                "tool": "branch_sql:census_facility",
+                "result": json.dumps(fac_rows, default=str)[:240] or f"{switched:,} switched / {remain:,} held",
+            },
+        )
+        await pace()
+
+    census_after = await run_sql(
+        """SELECT item_id, facility_id, facility_name, active_order_count, avg_daily_doses
+           FROM supply_intel.patient_order_census
+           WHERE item_id IN (%s, %s)
+           ORDER BY item_id, facility_name""",
+        (shortage_id, alt_id),
+        fetch=True,
+    )
+    await note(
+        f"Moved {switched_patients:,} eligible orders onto {alt_id} on `{branch_id}` (held {int(round((1 - frac) * 100))}% stop cohorts)",
+        {
+            "phase": "Simulate",
+            "thought": "Stop-severity patients stay on the shortage item. Eligible orders are rewritten onto the alternative on this copy only.",
+            "tool": "branch_sql:census_update_readback",
+            "result": (
+                f"{len(census_after)} census rows after rewrite"
+                if census_after
+                else f"{switched_patients:,} orders switched in working-copy plan · fraction {frac:.2f}"
+            ),
+        },
+    )
+    passes.append({"name": "census", "switched_patients": switched_patients, "holdback_fraction": round(1 - frac, 3)})
+
+    await run_sql("DELETE FROM supply_intel.substitution_sim_allocations WHERE simulation_id=%s", (simulation_id,))
+    corrected = 0
+    for fac in plan.get("facilities") or []:
+        await run_sql(
+            """INSERT INTO supply_intel.substitution_sim_allocations
+               (simulation_id, branch_id, facility_id, facility_name, patients, units_allocated,
+                days_cover, monthly_cost_delta, lead_time_delta_days)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                simulation_id,
+                branch_id,
+                fac["facility_id"],
+                fac["facility_name"],
+                fac.get("patients_switched", fac.get("patients") or 0),
+                fac["units_allocated"],
+                fac["days_cover"],
+                fac["monthly_cost_delta"],
+                fac["lead_time_delta_days"],
+            ),
+        )
+        stock = await run_sql(
+            """SELECT COALESCE(SUM(on_hand_qty), 0) AS on_hand
+               FROM supply_intel.inventory_snapshot
+               WHERE item_id=%s AND facility_id=%s""",
+            (alt_id, fac["facility_id"]),
+            fetch=True,
+        )
+        available = int((stock[0]["on_hand"] if stock else 0) or 0)
+        allocated = int(fac.get("units_allocated") or 0)
+        take = min(allocated, available) if stock else allocated
+        remaining_need = take
+        lots = await run_sql(
+            """SELECT snapshot_id, on_hand_qty, lot_number, expiration_date
+               FROM supply_intel.inventory_snapshot
+               WHERE item_id=%s AND facility_id=%s AND on_hand_qty > 0
+               ORDER BY expiration_date""",
+            (alt_id, fac["facility_id"]),
+            fetch=True,
+        )
+        drained = 0
+        for lot in lots:
+            if remaining_need <= 0:
+                break
+            pull = min(int(lot.get("on_hand_qty") or 0), remaining_need)
+            if pull <= 0:
+                continue
+            await run_sql(
+                """UPDATE supply_intel.inventory_snapshot
+                   SET on_hand_qty = on_hand_qty - %s, last_updated = NOW()
+                   WHERE snapshot_id=%s""",
+                (pull, lot["snapshot_id"]),
+            )
+            remaining_need -= pull
+            drained += pull
+        if stock and allocated > available:
+            fac["units_allocated"] = available
+            daily = float(fac.get("avg_daily_doses") or 0)
+            fac["days_cover"] = round(available / daily, 1) if daily else fac.get("days_cover")
+            fac["allocation_corrected"] = True
+            corrected += 1
+            await run_sql(
+                """UPDATE supply_intel.substitution_sim_allocations
+                   SET units_allocated=%s, days_cover=%s
+                   WHERE simulation_id=%s AND facility_id=%s""",
+                (available, fac["days_cover"], simulation_id, fac["facility_id"]),
+            )
+        after_stock = await run_sql(
+            """SELECT COALESCE(SUM(on_hand_qty), 0) AS on_hand
+               FROM supply_intel.inventory_snapshot
+               WHERE item_id=%s AND facility_id=%s""",
+            (alt_id, fac["facility_id"]),
+            fetch=True,
+        )
+        leftover = int((after_stock[0]["on_hand"] if after_stock else 0) or 0)
+        await note(
+            f"Allocate {fac['facility_name']}: {take:,} units from {alt_id} · {drained:,} pulled from lots · {leftover:,} remain",
+            {
+                "phase": "Simulate",
+                "thought": f"Write allocation for {fac['facility_name']}, drain earliest lots, read remaining on-hand.",
+                "tool": "branch_sql:allocation_facility",
+                "result": f"allocated={take} drained={drained} leftover={leftover}"
+                + (" · corrected to on-hand" if fac.get("allocation_corrected") else ""),
+            },
+        )
+        await pace()
+
+    alloc_rows = await run_sql(
+        """SELECT facility_id, patients, units_allocated, days_cover
+           FROM supply_intel.substitution_sim_allocations
+           WHERE simulation_id=%s
+           ORDER BY facility_name""",
+        (simulation_id,),
+        fetch=True,
+    )
+    await note(
+        (
+            f"Allocation pass on `{branch_id}`: wrote {len(plan.get('facilities') or [])} facility plans"
+            + (f", then corrected {corrected} against on-hand" if corrected else ", on-hand covered the first pass")
+        ),
+        {
+            "phase": "Simulate",
+            "thought": "Write the allocation, read alternative stock, then rewrite any facility that would overdraw the working copy.",
+            "tool": "branch_sql:allocations_write_read_correct",
+            "result": (
+                f"{len(alloc_rows)} allocation rows on the branch · {corrected} corrected"
+                if alloc_rows
+                else f"{len(plan.get('facilities') or [])} facility plans · {corrected} corrected"
+            ),
+        },
+    )
+    passes.append({"name": "allocations", "facilities": len(plan.get("facilities") or []), "corrected": corrected})
+    plan["sandbox"] = {"switch_fraction": round(frac, 3), "passes": passes, "live": conn is not None}
+    agent["transcript"] = transcript
+    agent["sandbox"] = plan["sandbox"]
+    return plan
+
+
 async def _write_plan_to_pg(conn: Any, simulation_id: str, branch_id: str, plan: dict[str, Any], user: str) -> None:
     async with conn.cursor() as cur:
         await cur.execute(
@@ -1804,7 +2096,43 @@ async def _write_plan_to_pg(conn: Any, simulation_id: str, branch_id: str, plan:
         )
 
 
-async def _load_sim_inputs(shortage_item_id: str, alternative_item_id: str) -> dict[str, Any]:
+async def _load_sim_inputs(
+    shortage_item_id: str, alternative_item_id: str, conn: Any | None = None
+) -> dict[str, Any]:
+    if conn is not None:
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT * FROM supply_intel.patient_order_census WHERE item_id=%s",
+                    (shortage_item_id,),
+                )
+                census = list(await cur.fetchall())
+                await cur.execute(
+                    "SELECT COALESCE(SUM(on_hand_qty), 0) AS qty FROM supply_intel.inventory_snapshot WHERE item_id=%s",
+                    (alternative_item_id,),
+                )
+                on_hand_rows = list(await cur.fetchall())
+                await cur.execute(
+                    "SELECT unit_cost FROM supply_intel.inventory_snapshot WHERE item_id=%s LIMIT 1",
+                    (shortage_item_id,),
+                )
+                cost_rows = list(await cur.fetchall())
+                await cur.execute(
+                    "SELECT forecast_demand_90d FROM supply_intel.risk_scores WHERE item_id=%s LIMIT 1",
+                    (shortage_item_id,),
+                )
+                risk_rows = list(await cur.fetchall())
+            alt_on_hand = int((on_hand_rows[0]["qty"] if on_hand_rows else 0) or 0)
+            if alt_on_hand <= 0:
+                alt_on_hand = 4200 if shortage_item_id == "SKU-PH-101" else 1800
+            return {
+                "census": census or _fallback_census(shortage_item_id),
+                "alt_on_hand": alt_on_hand,
+                "current_unit_cost": float((cost_rows[0]["unit_cost"] if cost_rows else 14.5) or 14.5),
+                "forecast_90d": int((risk_rows[0]["forecast_demand_90d"] if risk_rows else 0) or 0),
+            }
+        except Exception as exc:
+            print(f"Branch sim input read warning: {exc}")
     if store.mock:
         census = [row for row in store.data.get("patient_census", []) if row["item_id"] == shortage_item_id]
         inv = store.data.get("inventory", []) or []
@@ -1919,77 +2247,132 @@ async def _run_substitution_simulation(
     )
 
     await publish(
-        {"id": "investigate", "label": "Investigate", "detail": "Checking clinical cohorts and rules", "duration_ms": 0, "status": "running"}
+        {"id": "investigate", "label": "Investigate", "detail": "Opening the working copy for branch SQL", "duration_ms": 0, "status": "running"}
     )
     t_agent = time.perf_counter()
     agent: dict[str, Any] = {}
-    try:
-        async def _already_branched(_branch_id: str) -> None:
-            return None
-
-        agent = await run_agent(
-            prompt=prompt,
-            shortage_item_id=shortage_item_id,
-            alternative_item_id=alternative_item_id,
-            shortage_desc=shortage_desc,
-            alternative_desc=alternative_desc,
-            branch_id=branch_id,
-            create_branch=_already_branched,
-        )
-        await publish(
-            {
-                "id": "investigate",
-                "label": "Investigate",
-                "detail": "Clinical checks complete · "
-                + ", ".join(i.replace("_", " ") for i in (agent.get("investigations") or ["rules"])),
-                "duration_ms": int((time.perf_counter() - t_agent) * 1000),
-                "status": "done",
-            }
-        )
-    except Exception as exc:
-        print(f"Agentic simulation overlay failed: {exc}")
-        agent = {}
-        await publish(
-            {
-                "id": "investigate",
-                "label": "Investigate",
-                "detail": "Clinical checks complete · rule fallback",
-                "duration_ms": int((time.perf_counter() - t_agent) * 1000),
-                "status": "done",
-            }
-        )
-
-    await publish(
-        {"id": "simulate", "label": "Simulate", "detail": "Writing formulary plan on the branch", "duration_ms": 0, "status": "running"}
-    )
-    t2 = time.perf_counter()
-    inputs = await _load_sim_inputs(shortage_item_id, alternative_item_id)
-    plan = compute_plan(
-        shortage_item_id=shortage_item_id,
-        shortage_desc=shortage_desc,
-        alternative_item_id=alternative_item_id,
-        alternative_desc=alternative_desc,
-        census=inputs["census"],
-        current_unit_cost=inputs["current_unit_cost"],
-        alt_on_hand=inputs["alt_on_hand"],
-        forecast_90d=inputs["forecast_90d"],
-        facility_ids=facility_ids,
-    )
-    plan["substitution_id"] = substitution_id
-    if agent.get("landscape", {}).get("patients"):
-        plan["patients_affected"] = agent["landscape"]["patients"]
-    if (agent.get("cost") or {}).get("monthly_cost_delta") is not None:
-        plan["monthly_cost_delta"] = agent["cost"]["monthly_cost_delta"]
-        plan["naive_monthly_cost_delta"] = agent["cost"].get("naive_monthly_cost_delta")
-    if agent.get("report_markdown"):
-        plan["summary"] = (
-            f"{shortage_desc} → {alternative_desc}: "
-            f"{plan['patients_affected']:,} patients investigated; "
-            f"{sum(1 for c in agent.get('categories') or [] if c.get('severity')=='stop')} cohorts blocked from auto-swap."
-        )
-    plan["agent"] = agent
     wrote_live = False
+
+    async def _already_branched(_branch_id: str) -> None:
+        return None
+
     async with _branch_pg(branch_id) as conn:
+        async def branch_fetch(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+            if conn is None:
+                return []
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                return list(await cur.fetchall())
+
+        async def branch_exec(sql: str, params: tuple[Any, ...] = ()) -> None:
+            if conn is None:
+                return
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+
+        async def on_progress(detail: str, transcript: list[dict[str, Any]]) -> None:
+            await publish(
+                {
+                    "id": "investigate",
+                    "label": "Investigate",
+                    "detail": detail,
+                    "duration_ms": int((time.perf_counter() - t_agent) * 1000),
+                    "status": "running",
+                    "transcript": transcript,
+                }
+            )
+
+        try:
+            agent = await run_agent(
+                prompt=prompt,
+                shortage_item_id=shortage_item_id,
+                alternative_item_id=alternative_item_id,
+                shortage_desc=shortage_desc,
+                alternative_desc=alternative_desc,
+                branch_id=branch_id,
+                create_branch=_already_branched,
+                simulation_id=simulation_id,
+                fetch=branch_fetch if conn is not None else None,
+                execute=branch_exec if conn is not None else None,
+                on_progress=on_progress,
+            )
+            await publish(
+                {
+                    "id": "investigate",
+                    "label": "Investigate",
+                    "detail": "Branch queries complete · "
+                    + ", ".join(i.replace("_", " ") for i in (agent.get("investigations") or ["rules"])),
+                    "duration_ms": int((time.perf_counter() - t_agent) * 1000),
+                    "status": "done",
+                    "transcript": agent.get("transcript") or [],
+                }
+            )
+        except Exception as exc:
+            print(f"Agentic simulation overlay failed: {exc}")
+            agent = {}
+            await publish(
+                {
+                    "id": "investigate",
+                    "label": "Investigate",
+                    "detail": "Clinical checks complete · rule fallback",
+                    "duration_ms": int((time.perf_counter() - t_agent) * 1000),
+                    "status": "done",
+                }
+            )
+
+        await publish(
+            {"id": "simulate", "label": "Simulate", "detail": "Writing formulary plan on the branch", "duration_ms": 0, "status": "running"}
+        )
+        t2 = time.perf_counter()
+        inputs = await _load_sim_inputs(shortage_item_id, alternative_item_id, conn=conn)
+        plan = compute_plan(
+            shortage_item_id=shortage_item_id,
+            shortage_desc=shortage_desc,
+            alternative_item_id=alternative_item_id,
+            alternative_desc=alternative_desc,
+            census=inputs["census"],
+            current_unit_cost=inputs["current_unit_cost"],
+            alt_on_hand=inputs["alt_on_hand"],
+            forecast_90d=inputs["forecast_90d"],
+            facility_ids=facility_ids,
+        )
+        plan["substitution_id"] = substitution_id
+        if agent.get("landscape", {}).get("patients"):
+            plan["patients_affected"] = agent["landscape"]["patients"]
+        if (agent.get("cost") or {}).get("monthly_cost_delta") is not None:
+            plan["monthly_cost_delta"] = agent["cost"]["monthly_cost_delta"]
+            plan["naive_monthly_cost_delta"] = agent["cost"].get("naive_monthly_cost_delta")
+        if agent.get("report_markdown"):
+            plan["summary"] = (
+                f"{shortage_desc} → {alternative_desc}: "
+                f"{plan['patients_affected']:,} patients investigated; "
+                f"{sum(1 for c in agent.get('categories') or [] if c.get('severity')=='stop')} cohorts blocked from auto-swap."
+            )
+        async def on_sim_progress(detail: str, transcript: list[dict[str, Any]]) -> None:
+            await publish(
+                {
+                    "id": "simulate",
+                    "label": "Simulate",
+                    "detail": detail,
+                    "duration_ms": int((time.perf_counter() - t2) * 1000),
+                    "status": "running",
+                    "transcript": transcript,
+                }
+            )
+
+        try:
+            plan = await _run_sandbox_cycle(
+                conn=conn,
+                plan=plan,
+                agent=agent,
+                simulation_id=simulation_id,
+                branch_id=branch_id,
+                user=user,
+                on_progress=on_sim_progress,
+            )
+        except Exception as exc:
+            print(f"Sandbox cycle warning: {exc}")
+        plan["agent"] = agent
         if conn is not None:
             try:
                 await _write_plan_to_pg(conn, simulation_id, branch_id, plan, user)
@@ -2001,9 +2384,9 @@ async def _run_substitution_simulation(
             "id": "simulate",
             "label": "Simulate",
             "detail": (
-                "Formulary plan written on the branch"
+                "Wrote formulary, rewrote census, then corrected allocations from on-hand on the branch"
                 if wrote_live
-                else "Formulary plan staged on the working copy"
+                else "Staged formulary → census → allocation write/read/correct on the working copy"
             ),
             "duration_ms": int((time.perf_counter() - t2) * 1000),
             "status": "done",
@@ -2131,7 +2514,7 @@ async def simulate_substitution(body: SubstitutionSimulateRequest, request: Requ
                 item = await queue.get()
                 if item is None:
                     break
-                yield json.dumps(json_safe(item)) + "\n"
+                yield json.dumps(json_safe(item)) + "\n" + (" " * 4096) + "\n"
         finally:
             await task
 

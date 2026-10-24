@@ -81,6 +81,9 @@ def test_recommended_orders_and_decision():
     )
     assert comment_resp.status_code == 200
     assert comment_resp.json()["comments"] == "Hold for weekend OR volume"
+    saved = client.get("/api/recommended-orders").json()
+    stored = next(o for o in saved if o["recommendation_id"] == order_id)
+    assert stored["comments"] == "Hold for weekend OR volume"
 
 
 def test_substitutions_and_selection():
@@ -381,6 +384,15 @@ def test_agentic_lisinopril_simulation_from_prompt():
     assert impact["naive_monthly_cost_delta"] == 52000
     assert any(turn["phase"] == "Investigate" for turn in agent["transcript"])
     assert "angioedema" in agent["report_markdown"].lower()
+    assert "inventory_cover" in agent["investigations"]
+    assert any("formulary" in (turn.get("tool") or "") or "inventory" in (turn.get("tool") or "") or "cohort" in (turn.get("tool") or "") for turn in agent["transcript"])
+    assert len(agent["transcript"]) >= 8
+    tools = [turn.get("tool") or "" for turn in agent["transcript"]]
+    assert any(tool == "branch_sql:formulary_update" for tool in tools)
+    assert any(tool == "branch_sql:formulary_readback" for tool in tools)
+    assert any(tool == "branch_sql:census_update_readback" for tool in tools)
+    assert any(tool == "branch_sql:allocations_write_read_correct" for tool in tools)
+    assert impact.get("sandbox", {}).get("passes")
 
 
 def test_decision_insights_endpoint():
