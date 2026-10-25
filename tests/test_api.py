@@ -307,11 +307,16 @@ def test_substitution_branch_simulation_workflow():
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
 
+    formulary_before = [dict(row) for row in store.data.get("formulary", [])]
+    selections_before = len(store.data.get("substitution_selections") or [])
     shipped = client.post(
         f"/api/substitutions/simulate/{replay['simulation_id']}/replay"
     )
     assert shipped.status_code == 200
     assert shipped.json()["status"] == "shipped"
+    assert shipped.json()["production_changed"] is False
+    assert [dict(row) for row in store.data.get("formulary", [])] == formulary_before
+    assert len(store.data.get("substitution_selections") or []) == selections_before
 
     again = client.post(
         "/api/substitutions/simulate",

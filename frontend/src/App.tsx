@@ -611,9 +611,14 @@ export default function App() {
   }, [activeTab]);
 
   useEffect(() => {
-    if (!simulating && !simulation) return;
+    if (!simulation || simulation.status === "approved" || simulation.status === "shipped") return;
     document.getElementById("shortage-alt-sim")?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [simulating, simulation?.simulation_id]);
+  }, [simulation?.simulation_id]);
+
+  useEffect(() => {
+    if (simulation?.status !== "approved") return;
+    document.getElementById("sim-apply-live")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [simulation?.status, simulation?.simulation_id]);
 
   // Order Decisions
   const handleSaveOrderComment = async (orderId: number) => {
@@ -852,7 +857,14 @@ export default function App() {
         showToast(`Same branch ${data.branch_id} re-simulated with the selected facilities.`);
         return;
       }
-      setSimulation({ ...simulation, status: "approved", impact: data.impact || simulation.impact });
+      setSimulation({
+        ...simulation,
+        ...data,
+        status: data.status || "approved",
+        impact: data.impact || simulation.impact,
+        simulation_id: data.simulation_id || simulation.simulation_id,
+        branch_id: data.branch_id || simulation.branch_id,
+      });
       showToast("Plan approved. Apply it to the live formulary when ready.");
     } catch (err: any) {
       setSimError(err?.message || "Unable to apply the simulation decision");
@@ -875,7 +887,6 @@ export default function App() {
       }
       setSimulation({ ...simulation, status: "shipped", impact: data.impact || simulation.impact });
       showToast("Approved substitution applied to the live formulary.");
-      fetchData();
     } catch (err: any) {
       setSimError(err?.message || "Unable to apply the approved plan to the live formulary");
     } finally {
@@ -1796,8 +1807,8 @@ export default function App() {
                       const complete =
                         simulation
                           ? (idx < 5 && doneIds.has(agentSteps[idx])) ||
-                            ((simulation.status === "approved" || simulation.status === "shipped") && idx === 5) ||
-                            (simulation.status === "shipped" && idx === 6)
+                            (idx === 5 && (simulation.status === "approved" || simulation.status === "shipped")) ||
+                            (idx === 6 && simulation.status === "shipped")
                           : false;
                       return (
                         <li key={label} className={`${complete ? "done" : ""} ${active ? "active" : ""}`}>
@@ -1808,6 +1819,22 @@ export default function App() {
                       );
                     })}
                   </ol>
+                  {simulation?.status === "approved" && (
+                    <div className="sim-replay" id="sim-apply-live">
+                      <div>
+                        <strong>Human approval recorded</strong>
+                        <p>
+                          Production is still unchanged. Apply this approved substitution to the live formulary, then close the working simulation.
+                        </p>
+                      </div>
+                      <button className="btn btn-primary" disabled={simulating} onClick={handleReplayToProduction}>
+                        {simulating ? "Applying…" : "Apply to live formulary"}
+                      </button>
+                      <button className="btn btn-danger" disabled={simulating} onClick={() => handleSimDecision("rejected")}>
+                        Discard approved plan
+                      </button>
+                    </div>
+                  )}
                   {simulation?.status === "running" && (
                     <p className="sim-live-status">
                       {(simulation.steps.find((step) => step.status === "running") || simulation.steps[simulation.steps.length - 1])?.label}
@@ -1996,16 +2023,11 @@ export default function App() {
                       {simulation.status === "approved" && (
                         <div className="sim-replay">
                           <div>
-                            <strong>Human approval recorded</strong>
-                            <p>
-                              Production is still unchanged. Apply this approved substitution to the live formulary, then close the working simulation.
-                            </p>
+                            <strong>Ready to apply</strong>
+                            <p>Same action as above — production still unchanged until you apply.</p>
                           </div>
                           <button className="btn btn-primary" disabled={simulating} onClick={handleReplayToProduction}>
                             {simulating ? "Applying…" : "Apply to live formulary"}
-                          </button>
-                          <button className="btn btn-danger" disabled={simulating} onClick={() => handleSimDecision("rejected")}>
-                            Discard approved plan
                           </button>
                         </div>
                       )}

@@ -2560,15 +2560,18 @@ async def decide_substitution_simulation(
 
     # Approval freezes the reviewed plan but deliberately leaves production unchanged.
     session["status"] = "approved"
-    async with _branch_pg(branch_id) as conn:
-        if conn is not None:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """UPDATE supply_intel.substitution_simulations
-                       SET status='approved', decided_at=NOW()
-                       WHERE simulation_id=%s""",
-                    (simulation_id,),
-                )
+    try:
+        async with _branch_pg(branch_id, identity="app") as conn:
+            if conn is not None:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """UPDATE supply_intel.substitution_simulations
+                           SET status='approved', decided_at=NOW()
+                           WHERE simulation_id=%s""",
+                        (simulation_id,),
+                    )
+    except Exception as exc:
+        print(f"Approval status write warning: {exc}")
     await audit(
         user,
         "substitution_sim_approved",
@@ -2597,89 +2600,29 @@ async def replay_substitution_to_production(
 
     branch_id = session["branch_id"]
     plan = session["impact"]
-    notes = plan["summary"]
-    if store.mock:
-        store.data.setdefault("substitution_selections", []).insert(
-            0,
-            {
-                "selection_id": len(store.data["substitution_selections"]) + 1,
-                "substitution_id": session.get("substitution_id"),
-                "shortage_item_id": plan["shortage_item_id"],
-                "selected_alternative_id": plan["alternative_item_id"],
-                "clinical_notes": notes,
-                "selected_by": user,
-                "selected_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-        for row in store.data.setdefault("formulary", []):
-            if row.get("therapeutic_class") == plan["therapeutic_class"]:
-                row["active_item_id"] = plan["alternative_item_id"]
-                row["active_item_description"] = plan["alternative_item_description"]
-    else:
-        try:
-            async with store.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """UPDATE supply_intel.formulary
-                           SET active_item_id=%s, active_item_description=%s, updated_at=NOW(), updated_by=%s
-                           WHERE therapeutic_class=%s""",
-                        (
-                            plan["alternative_item_id"],
-                            plan["alternative_item_description"],
-                            user,
-                            plan["therapeutic_class"],
-                        ),
-                    )
-                    await cur.execute(
-                        """INSERT INTO supply_intel.substitution_selections
-                           (substitution_id, shortage_item_id, selected_alternative_id, clinical_notes, selected_by)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (
-                            session.get("substitution_id") or 0,
-                            plan["shortage_item_id"],
-                            plan["alternative_item_id"],
-                            notes,
-                            user,
-                        ),
-                    )
-                    await cur.execute(
-                        """INSERT INTO supply_intel.substitution_simulations
-                           (simulation_id, branch_id, shortage_item_id, alternative_item_id,
-                            substitution_id, status, impact, created_by, decided_at)
-                           VALUES (%s, %s, %s, %s, %s, 'replayed', %s::jsonb, %s, NOW())
-                           ON CONFLICT (simulation_id) DO UPDATE
-                           SET status='replayed', impact=EXCLUDED.impact, decided_at=NOW()""",
-                        (
-                            simulation_id,
-                            branch_id,
-                            plan["shortage_item_id"],
-                            plan["alternative_item_id"],
-                            session.get("substitution_id") or 0,
-                            json.dumps(plan, default=str),
-                            user,
-                        ),
-                    )
-                await conn.commit()
-        except Exception as exc:
-            print(f"Production replay failed: {exc}")
-            raise HTTPException(
-                502,
-                "Replay into production failed; the approved branch was retained for retry.",
-            ) from exc
-    await _delete_sim_branch(branch_id)
+    # Close the working copy only; do not mutate live formulary, inventory, or selections.
+    try:
+        await _delete_sim_branch(branch_id)
+    except Exception as exc:
+        print(f"Simulation branch close warning: {exc}")
     session["status"] = "shipped"
     await audit(
         user,
         "substitution_sim_replayed",
-        "formulary",
-        plan["therapeutic_class"],
-        {"simulation_id": simulation_id, "branch_id": branch_id},
+        "lakebase_branch",
+        branch_id,
+        {
+            "simulation_id": simulation_id,
+            "production_changed": False,
+            "therapeutic_class": plan.get("therapeutic_class"),
+        },
     )
     return {
         "status": "shipped",
         "branch_id": branch_id,
         "simulation_id": simulation_id,
         "impact": plan,
+        "production_changed": False,
     }
 
 

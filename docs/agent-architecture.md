@@ -60,7 +60,7 @@ On **Clinical Substitutions**:
 2. Agent steps: **Isolate → Connect → Investigate → Simulate → Recommend**.
 3. Pharmacist reviews categories, unexpected findings, transcript, and report.
 4. **Approve plan** freezes the recommendation; production is still unchanged.
-5. **Apply to live formulary** writes the approved change to production and closes the working copy.
+5. **Apply to live formulary** closes the working copy. Live OLTP is not mutated from this path.
 6. **Discard** drops the simulation (and branch when live). **Re-simulate selected facilities** reuses the same branch with a facility filter.
 
 Shortage candidate queues (for example Cefazolin / Cefuroxime) are **not** the live formulary. Applying a plan does not by itself remove a pair from the candidate list.
@@ -186,9 +186,9 @@ Unexpected findings typically include: P&T class-switch flag, pediatric patients
 
 ## Guardrails
 
-- Simulation is isolated on a `sim-` branch until apply.
+- Simulation is isolated on a `sim-` branch. Apply closes the working copy without writing live OLTP.
 - The Databricks App SP creates the `sim-` branch. A **separate agent service principal** (`LAKEBASE_AGENT_CLIENT_ID`) is granted a Postgres role on that branch only and is the identity that reads/writes simulation SQL. Production OLTP stays on the app SP; the agent SP is never granted on production.
-- Approve ≠ apply. Production changes only on **Apply to live formulary**.
+- Approve ≠ apply. Apply closes the working copy; live formulary is left unchanged.
 - Stop-severity cohorts (angioedema, age exclusion) must not be treated as auto-swap.
 - Foundation Model output is constrained to known investigation IDs; unknown IDs are dropped.
 - Pharmacist review is required before any live formulary change.
